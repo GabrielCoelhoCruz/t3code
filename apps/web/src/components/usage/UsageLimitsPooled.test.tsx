@@ -1,3 +1,5 @@
+// @vitest-environment jsdom
+
 import {
   EnvironmentId,
   ProviderDriverKind,
@@ -5,12 +7,11 @@ import {
   type ServerProvider,
 } from "@t3tools/contracts";
 import type { LimitPresentations } from "@t3tools/shared/usageLimits";
-import { act, type PropsWithChildren, type ReactElement } from "react";
-import { create, type ReactTestRenderer } from "react-test-renderer";
+import { act } from "react";
+import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vite-plus/test";
 
 const consume = vi.hoisted(() => vi.fn());
-
 vi.mock("../../state/session", () => ({
   useEnvironmentScope: () => true,
   readEnvironmentScope: () => true,
@@ -20,43 +21,6 @@ vi.mock("../../state/use-atom-command", () => ({ useAtomCommand: () => consume }
 vi.mock("../../hooks/useSettings", () => ({ usePrimarySettings: () => "24h" }));
 vi.mock("../chat/ProviderInstanceIcon", () => ({ ProviderInstanceIcon: () => null }));
 vi.mock("../settings/RedactedSensitiveText", () => ({ RedactedSensitiveText: () => null }));
-vi.mock("../ui/button", () => ({ Button: "button" }));
-vi.mock("../ui/tooltip", () => ({ Tooltip: "div", TooltipPopup: "div", TooltipTrigger: "div" }));
-// Popovers and dialogs portal and animate; these keep only the open state the segment owns.
-vi.mock("../ui/popover", async () => {
-  const React = await import("react");
-  const Open = React.createContext({ open: false, toggle: () => {} });
-  return {
-    Popover: ({
-      open,
-      onOpenChange,
-      children,
-    }: PropsWithChildren<{ open: boolean; onOpenChange: (open: boolean) => void }>) => {
-      const value = React.useMemo(
-        () => ({ open, toggle: () => onOpenChange(!open) }),
-        [open, onOpenChange],
-      );
-      return <Open.Provider value={value}>{children}</Open.Provider>;
-    },
-    PopoverTrigger: ({
-      render,
-      children,
-    }: PropsWithChildren<{ render: ReactElement<{ onClick?: () => void }> }>) =>
-      React.cloneElement(render, { onClick: React.useContext(Open).toggle }, children),
-    PopoverPopup: ({ children }: PropsWithChildren) =>
-      React.useContext(Open).open ? <div>{children}</div> : null,
-  };
-});
-vi.mock("../ui/alert-dialog", () => ({
-  AlertDialog: ({ open, children }: PropsWithChildren<{ open: boolean }>) =>
-    open ? <div role="dialog">{children}</div> : null,
-  AlertDialogPopup: "div",
-  AlertDialogHeader: "div",
-  AlertDialogTitle: "div",
-  AlertDialogDescription: "div",
-  AlertDialogFooter: "div",
-  AlertDialogClose: "div",
-}));
 
 import { UsageLimitsPooled } from "./UsageLimitsPooled";
 
@@ -102,61 +66,72 @@ const presentations: LimitPresentations = new Map([
   ],
 ]);
 
-let renderer: ReactTestRenderer;
+let root: Root;
+let container: HTMLDivElement;
 
-const button = (label: string) =>
-  renderer.root.find((node) => node.type === "button" && node.children.includes(label));
-const segment = () =>
-  renderer.root.find(
-    (node) => node.type === "button" && node.props["aria-label"]?.startsWith("Alpha:"),
-  );
-const text = (node: ReactTestRenderer["root"] | string): string =>
-  typeof node === "string" ? node : node.children.map(text).join("");
-const status = () =>
-  renderer.root
-    .findAll((node) => node.props.role === "status")
-    .map(text)
-    .join(" ");
-
-/** Confirms a reset whose answer the test releases, closing the popover the way a click does. */
-async function confirmHeldReset() {
-  let answer!: (result: unknown) => void;
-  consume.mockReturnValue(new Promise((resolve) => (answer = resolve)));
-  await act(() => {
-    renderer = create(<UsageLimitsPooled presentations={presentations} now={0} />);
-  });
-  await act(() => segment().props.onClick());
-  await act(() => button("Use reset").props.onClick());
-  await act(() => button("Use credit").props.onClick());
-  return answer;
-}
-
-beforeEach(() => {
+beforeEach(async () => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  vi.stubGlobal(
+    "ResizeObserver",
+    class {
+      observe() {}
+      disconnect() {}
+      unobserve() {}
+    },
+  );
   consume.mockReset();
+  container = document.createElement("div");
+  document.body.append(container);
+  root = createRoot(container);
+  await act(() => root.render(<UsageLimitsPooled presentations={presentations} now={0} />));
 });
 
 afterEach(async () => {
-  await act(() => renderer.unmount());
+  await act(() => root.unmount());
+  container.remove();
   vi.unstubAllGlobals();
 });
 
-it("shows the pending reset after its popover closes, then the outcome", async () => {
-  const answer = await confirmHeldReset();
-  expect(consume).toHaveBeenCalledOnce();
-  expect(status()).toBe("Alpha Using reset credit…");
-
-  await act(() => segment().props.onClick());
-  expect(button("Using…").props.disabled).toBe(true);
-
-  await act(async () => answer({ _tag: "Success", value: { outcome: "reset" } }));
-  expect(status()).toBe("Alpha Reset applied. Your windows have cleared.");
-});
-
-it("replaces the pending reset with the failure", async () => {
-  const answer = await confirmHeldReset();
-  await act(async () =>
-    answer({ _tag: "Failure", cause: { error: new Error("Codex rejected the credit.") } }),
+async function click(label: string) {
+  const button = Array.from(document.querySelectorAll("button")).find(
+    (node) => node.textContent === label || node.getAttribute("aria-label")?.startsWith(label),
   );
-  expect(status()).toBe("Alpha Codex rejected the credit.");
+  expect(button).toBeDefined();
+  await act(() => button!.click());
+}
+
+it.each([
+  {
+    label: "success",
+    result: { _tag: "Success", value: { outcome: "reset" } },
+    text: "Reset applied. Your windows have cleared.",
+  },
+  {
+    label: "failure",
+    result: { _tag: "Failure", cause: { error: new Error("Codex rejected the credit.") } },
+    text: "Codex rejected the credit.",
+  },
+])("keeps pending feedback outside the closed popup until $label", async ({ result, text }) => {
+  let answer!: (result: unknown) => void;
+  consume.mockReturnValue(new Promise((resolve) => (answer = resolve)));
+  await click("Alpha:");
+  await click("Use reset");
+  expect(consume).not.toHaveBeenCalled();
+  await click("Cancel");
+  expect(consume).not.toHaveBeenCalled();
+  await click("Alpha:");
+  await click("Use reset");
+  await click("Use credit");
+  expect(consume).toHaveBeenCalledOnce();
+  expect(document.querySelector('[role="alertdialog"]')).toBeNull();
+  expect(document.querySelector('[data-slot="popover-popup"]')).toBeNull();
+  const status = document.querySelector('[role="status"]');
+  expect(status?.textContent).toBe("Alpha Using reset credit…");
+  await click("Alpha:");
+  const using = Array.from(document.querySelectorAll("button")).find(
+    (node) => node.textContent === "Using…",
+  );
+  expect(using?.disabled).toBe(true);
+  await act(async () => answer(result));
+  expect(status?.textContent).toBe(`Alpha ${text}`);
 });
